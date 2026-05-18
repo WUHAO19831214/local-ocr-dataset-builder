@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, ref } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { Clipboard, ExternalLink, Play } from 'lucide-vue-next'
 
 const languages = [
@@ -9,11 +9,23 @@ const languages = [
   'zh-Hant,ja-JP,zh-Hans',
 ]
 
+const processModes = [
+  { label: '普通教材 OCR', value: 'normal' },
+  { label: '物理/数学公式优先', value: 'formula' },
+]
+
+const forceOcrOptions = [
+  { label: '开启', value: true },
+  { label: '关闭', value: false },
+]
+
 const form = ref({
   pdf_path: '/Users/wuhao/my-pdf-tool/my-pdf-tool/dajiaderiyufudaoshu12_p1_2.pdf',
   output_root: '/Users/wuhao/my-pdf-tool/datasets',
   output_name: 'test_builder_p1_2',
   ocr_lang: languages[0],
+  process_mode: processModes[0].value,
+  force_ocr: true,
 })
 
 const job = ref(null)
@@ -26,6 +38,13 @@ const expectedOutputPath = computed(() => {
   const root = form.value.output_root.replace(/\/+$/, '')
   return root && form.value.output_name ? `${root}/${form.value.output_name}` : ''
 })
+
+watch(
+  () => form.value.process_mode,
+  (mode) => {
+    form.value.force_ocr = mode === 'normal'
+  }
+)
 
 let pollTimer = null
 
@@ -144,7 +163,7 @@ onBeforeUnmount(() => {
           <input v-model.trim="form.output_root" type="text" autocomplete="off" placeholder="/absolute/path/datasets" />
         </label>
 
-        <div class="two-column">
+        <div class="form-grid">
           <label>
             <span>输出名称</span>
             <input v-model.trim="form.output_name" type="text" autocomplete="off" placeholder="book_dataset" />
@@ -158,7 +177,29 @@ onBeforeUnmount(() => {
               </option>
             </select>
           </label>
+
+          <label>
+            <span>处理模式</span>
+            <select v-model="form.process_mode">
+              <option v-for="mode in processModes" :key="mode.value" :value="mode.value">
+                {{ mode.label }}
+              </option>
+            </select>
+          </label>
+
+          <label>
+            <span>强制 OCR</span>
+            <select v-model="form.force_ocr">
+              <option v-for="option in forceOcrOptions" :key="String(option.value)" :value="option.value">
+                {{ option.label }}
+              </option>
+            </select>
+          </label>
         </div>
+
+        <p v-if="form.process_mode === 'formula'" class="mode-hint">
+          该模式会启用 Docling 公式增强。默认不强制 OCR，以尽量保留 PDF 原生公式结构；如遇扫描件或识别不完整，可手动开启强制 OCR。
+        </p>
 
         <button class="primary-action" type="submit" :disabled="busy">
           <Play :size="18" />
@@ -198,4 +239,3 @@ onBeforeUnmount(() => {
     </section>
   </main>
 </template>
-

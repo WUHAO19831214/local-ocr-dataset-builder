@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
@@ -5,6 +7,7 @@ from pydantic import BaseModel, Field
 
 JobStatus = Literal["queued", "running", "success", "failed"]
 ProgressStage = Literal["queued", "markdown", "json", "normalize", "done", "failed"]
+ProcessMode = Literal["normal", "formula"]
 
 
 class HealthResponse(BaseModel):
@@ -16,6 +19,8 @@ class StartJobRequest(BaseModel):
     output_root: str = Field(..., min_length=1)
     output_name: str = Field(..., min_length=1)
     ocr_lang: str = Field(..., min_length=1)
+    process_mode: ProcessMode = "normal"
+    force_ocr: bool | None = None
 
 
 class JobResponse(BaseModel):
@@ -41,4 +46,3 @@ class OpenPathRequest(BaseModel):
 
 class OpenPathResponse(BaseModel):
     ok: bool
-

@@ -22,6 +22,23 @@ ALLOWED_LANGS = {
 }
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 OUTPUT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+FORMULA_BLOCK_RE = re.compile(r"\$\$(.*?)\$\$", re.DOTALL)
+MATH_SPAN_RE = re.compile(r"(\$\$.*?\$\$|\$.*?\$)", re.DOTALL)
+PA_POWER_RE = re.compile(
+    r"(?<![\w$])(?:10\s*\^\s*(?P<caret>-?\s*\d{1,2})\s*Pa\b|"
+    r"10\s+(?P<positive>\d{1,2})\s*Pa\b|"
+    r"10\s*-\s*(?P<negative>\d{1,2})\s*Pa\b)"
+)
+VACUUM_KEYWORDS = ("真空一般指气压低于一个大气压", "粗真空", "低真空", "高真空", "超高真空", "极高真空")
+VACUUM_CLASSIFICATION = "\n".join(
+    [
+        "粗真空（$10^5\\ \\mathrm{Pa}$～$10^3\\ \\mathrm{Pa}$）",
+        "低真空（$10^3\\ \\mathrm{Pa}$～$10^{-1}\\ \\mathrm{Pa}$）",
+        "高真空（$10^{-1}\\ \\mathrm{Pa}$～$10^{-6}\\ \\mathrm{Pa}$）",
+        "超高真空（$10^{-6}\\ \\mathrm{Pa}$～$10^{-10}\\ \\mathrm{Pa}$）",
+        "极高真空（低于 $10^{-12}\\ \\mathrm{Pa}$）",
+    ]
+)
 
 
 class OcrRunnerError(RuntimeError):
@@ -58,8 +75,12 @@ def validate_request(request: StartJobRequest) -> tuple[Path, Path, Path]:
 
 def run_ocr_job(request: StartJobRequest, log: Callable[[str], None], stage: Callable[[str], None]) -> Path:
     pdf_path, _, target_dir = validate_request(request)
+    force_ocr = _effective_force_ocr(request)
     log(f"开始处理 PDF：{pdf_path}")
     log(f"OCR 引擎：ocrmac，语言：{request.ocr_lang}")
+    log(f"处理模式：{'物理/数学公式优先' if request.process_mode == 'formula' else '普通教材 OCR'}")
+    log(f"强制 OCR：{'开启' if force_ocr else '关闭'}")
+    log(f"公式增强：{'开启' if request.process_mode == 'formula' else '关闭'}")
     log(f"目标输出目录：{target_dir}")
 
     with tempfile.TemporaryDirectory(prefix="local-ocr-dataset-builder-") as tmp:
@@ -69,15 +90,15 @@ def run_ocr_job(request: StartJobRequest, log: Callable[[str], None], stage: Cal
 
         stage("markdown")
         log("开始输出 Markdown")
-        _run_docling(pdf_path, md_dir, "md", request.ocr_lang, log)
+        _run_docling(pdf_path, md_dir, "md", request.ocr_lang, request.process_mode, force_ocr, log)
 
         stage("json")
         log("开始输出 JSON")
-        _run_docling(pdf_path, json_dir, "json", request.ocr_lang, log)
+        _run_docling(pdf_path, json_dir, "json", request.ocr_lang, request.process_mode, force_ocr, log)
 
         stage("normalize")
         log("开始整理 md/json/images")
-        _normalize_outputs(md_dir, json_dir, target_dir, request.output_name, log)
+        _normalize_outputs(md_dir, json_dir, target_dir, request.output_name, request.process_mode, log)
 
     stage("done")
     log("完成")
@@ -89,6 +110,8 @@ def _run_docling(
     output_dir: Path,
     output_format: str,
     ocr_lang: str,
+    process_mode: str,
+    force_ocr: bool,
     log: Callable[[str], None],
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -103,13 +126,16 @@ def _run_docling(
         str(output_dir),
         "--image-export-mode",
         "referenced",
-        "--force-ocr",
         "--ocr-engine",
         "ocrmac",
         "--ocr-lang",
         ocr_lang,
-        "-v",
     ]
+    if force_ocr:
+        command.append("--force-ocr")
+    if process_mode == "formula":
+        command.append("--enrich-formula")
+    command.append("-v")
 
     env = os.environ.copy()
     env["JAVA_HOME"] = str(JAVA_HOME)
@@ -157,6 +183,7 @@ def _normalize_outputs(
     json_dir: Path,
     target_dir: Path,
     output_name: str,
+    process_mode: str,
     log: Callable[[str], None],
 ) -> None:
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -186,6 +213,9 @@ def _normalize_outputs(
 
     md_text = md_file.read_text(encoding="utf-8")
     md_text = _rewrite_markdown_images(md_text, copied_by_name, images_dir, log)
+    if process_mode == "formula":
+        md_text = _postprocess_formula_markdown(md_text)
+        log("完成物理/数学公式 Markdown 后处理")
     out_md.write_text(md_text, encoding="utf-8")
     log(f"输出 Markdown：{out_md.name}")
 
@@ -219,3 +249,68 @@ def _rewrite_markdown_images(
 
     return re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", replace_image, md_text)
 
+
+def _effective_force_ocr(request: StartJobRequest) -> bool:
+    return request.force_ocr is True
+
+
+def _postprocess_formula_markdown(md_text: str) -> str:
+    def normalize_block(match: re.Match[str]) -> str:
+        formula = " ".join(match.group(1).strip().split())
+        return f"\n\n$${formula}$$\n\n"
+
+    normalized = FORMULA_BLOCK_RE.sub(normalize_block, md_text)
+    normalized = _replace_pa_powers(normalized)
+    normalized = _repair_vacuum_classification(normalized)
+    normalized = _repair_line_numbering(normalized)
+    return re.sub(r"\n{3,}", "\n\n", normalized).strip() + "\n"
+
+
+def _format_pa_power(exp: str) -> str:
+    exp = exp.replace(" ", "")
+    if exp.startswith("-"):
+        return f"$10^{{{exp}}}\\ \\mathrm{{Pa}}$"
+    return f"$10^{exp}\\ \\mathrm{{Pa}}$"
+
+
+def _replace_pa_powers(md_text: str) -> str:
+    parts = MATH_SPAN_RE.split(md_text)
+    for index, part in enumerate(parts):
+        if part.startswith("$"):
+            continue
+        parts[index] = PA_POWER_RE.sub(_replace_pa_match, part)
+    return "".join(parts)
+
+
+def _replace_pa_match(match: re.Match[str]) -> str:
+    if match.group("caret") is not None:
+        return _format_pa_power(match.group("caret"))
+    if match.group("positive") is not None:
+        return _format_pa_power(match.group("positive"))
+    return _format_pa_power(f"-{match.group('negative')}")
+
+
+def _repair_vacuum_classification(md_text: str) -> str:
+    if not all(keyword in md_text for keyword in VACUUM_KEYWORDS):
+        return md_text
+
+    start = md_text.find("粗真空")
+    end_anchor = md_text.find("极高真空", start)
+    if start == -1 or end_anchor == -1:
+        return md_text
+
+    paragraph_end = md_text.find("\n\n", end_anchor)
+    line_end = md_text.find("\n", end_anchor)
+    if paragraph_end != -1 and paragraph_end - start < 2000:
+        end = paragraph_end
+    elif line_end != -1 and line_end - start < 2000:
+        end = line_end
+    else:
+        end = end_anchor + len("极高真空")
+
+    return f"{md_text[:start]}{VACUUM_CLASSIFICATION}{md_text[end:]}"
+
+
+def _repair_line_numbering(md_text: str) -> str:
+    repaired = re.sub(r"(?m)^-\s*(\d{1,2})\.([^\s\n])", r"\1. \2", md_text)
+    return re.sub(r"(?m)^(\d{1,2})\.([^\s\n])", r"\1. \2", repaired)
