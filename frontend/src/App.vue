@@ -12,6 +12,7 @@ const languages = [
 const processModes = [
   { label: '普通教材 OCR', value: 'normal' },
   { label: '物理/数学公式优先', value: 'formula' },
+  { label: '高精度公式复核（较慢）', value: 'formula_vl' },
 ]
 
 const forceOcrOptions = [
@@ -26,6 +27,7 @@ const form = ref({
   ocr_lang: languages[0],
   process_mode: processModes[0].value,
   force_ocr: true,
+  export_word: true,
 })
 
 const job = ref(null)
@@ -195,10 +197,21 @@ onBeforeUnmount(() => {
               </option>
             </select>
           </label>
+
+          <label>
+            <span>同时输出 Word</span>
+            <select v-model="form.export_word">
+              <option :value="true">是：原版式 + 可编辑</option>
+              <option :value="false">否</option>
+            </select>
+          </label>
         </div>
 
-        <p v-if="form.process_mode === 'formula'" class="mode-hint">
-          该模式会启用 Docling 公式增强。默认不强制 OCR，以尽量保留 PDF 原生公式结构；如遇扫描件或识别不完整，可手动开启强制 OCR。
+        <p v-if="form.process_mode !== 'normal'" class="mode-hint">
+          公式模式会启用 Docling 公式增强。高精度复核还会针对疑似行内公式和公式块调用本机 PaddleOCR-VL，保存裁图与逐项复核记录；处理时间可能明显增加。
+        </p>
+        <p v-if="form.export_word" class="mode-hint">
+          原版式 Word 每页是一张原 PDF 页面图片，版式与公式外观保真；可编辑 Word 使用 OCR 结果，识别错误仍需校对。
         </p>
 
         <button class="primary-action" type="submit" :disabled="busy">

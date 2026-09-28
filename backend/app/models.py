@@ -6,8 +6,8 @@ from pydantic import BaseModel, Field
 
 
 JobStatus = Literal["queued", "running", "success", "failed"]
-ProgressStage = Literal["queued", "markdown", "json", "normalize", "done", "failed"]
-ProcessMode = Literal["normal", "formula"]
+ProgressStage = Literal["queued", "markdown", "json", "normalize", "formula_vl", "word", "done", "failed"]
+ProcessMode = Literal["normal", "formula", "formula_vl"]
 
 
 class HealthResponse(BaseModel):
@@ -21,6 +21,7 @@ class StartJobRequest(BaseModel):
     ocr_lang: str = Field(..., min_length=1)
     process_mode: ProcessMode = "normal"
     force_ocr: bool | None = None
+    export_word: bool = True
 
 
 class JobResponse(BaseModel):

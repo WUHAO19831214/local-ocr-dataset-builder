@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from .models import StartJobRequest
+from .word_exporter import export_word_files
+from .formula_enhancer import PADDLE_PYTHON, enhance_formula_regions
 
 
 OCR_PROJECT_DIR = Path("/Users/wuhao/my-pdf-tool/my-pdf-tool")
@@ -63,6 +65,8 @@ def validate_request(request: StartJobRequest) -> tuple[Path, Path, Path]:
         raise OcrRunnerError("输出名称只能包含英文、数字、点、下划线、短横线，且必须以英文或数字开头")
     if not DOCLING_BIN.exists():
         raise OcrRunnerError(f"docling 命令不存在：{DOCLING_BIN}")
+    if request.process_mode == "formula_vl" and not PADDLE_PYTHON.is_file():
+        raise OcrRunnerError(f"高精度公式模式缺少 PaddleOCR-VL 环境：{PADDLE_PYTHON}")
 
     output_root.mkdir(parents=True, exist_ok=True)
     target_dir = output_root / request.output_name
@@ -78,9 +82,10 @@ def run_ocr_job(request: StartJobRequest, log: Callable[[str], None], stage: Cal
     force_ocr = _effective_force_ocr(request)
     log(f"开始处理 PDF：{pdf_path}")
     log(f"OCR 引擎：ocrmac，语言：{request.ocr_lang}")
-    log(f"处理模式：{'物理/数学公式优先' if request.process_mode == 'formula' else '普通教材 OCR'}")
+    mode_names = {"normal": "普通教材 OCR", "formula": "Docling 公式增强", "formula_vl": "高精度公式复核"}
+    log(f"处理模式：{mode_names[request.process_mode]}")
     log(f"强制 OCR：{'开启' if force_ocr else '关闭'}")
-    log(f"公式增强：{'开启' if request.process_mode == 'formula' else '关闭'}")
+    log(f"公式增强：{'开启' if request.process_mode != 'normal' else '关闭'}")
     log(f"目标输出目录：{target_dir}")
 
     with tempfile.TemporaryDirectory(prefix="local-ocr-dataset-builder-") as tmp:
@@ -99,6 +104,17 @@ def run_ocr_job(request: StartJobRequest, log: Callable[[str], None], stage: Cal
         stage("normalize")
         log("开始整理 md/json/images")
         _normalize_outputs(md_dir, json_dir, target_dir, request.output_name, request.process_mode, log)
+
+        if request.process_mode == "formula_vl":
+            stage("formula_vl")
+            log("开始高精度公式区域复核（PaddleOCR-VL，CPU 运行可能较慢）")
+            enhance_formula_regions(pdf_path, target_dir, request.output_name, log)
+
+        if request.export_word:
+            stage("word")
+            log("开始生成原版式和可编辑 Word")
+            for word_path in export_word_files(pdf_path, target_dir, request.output_name):
+                log(f"输出 Word：{word_path.name}")
 
     stage("done")
     log("完成")
@@ -133,7 +149,7 @@ def _run_docling(
     ]
     if force_ocr:
         command.append("--force-ocr")
-    if process_mode == "formula":
+    if process_mode in ("formula", "formula_vl"):
         command.append("--enrich-formula")
     command.append("-v")
 
@@ -213,7 +229,7 @@ def _normalize_outputs(
 
     md_text = md_file.read_text(encoding="utf-8")
     md_text = _rewrite_markdown_images(md_text, copied_by_name, images_dir, log)
-    if process_mode == "formula":
+    if process_mode in ("formula", "formula_vl"):
         md_text = _postprocess_formula_markdown(md_text)
         log("完成物理/数学公式 Markdown 后处理")
     out_md.write_text(md_text, encoding="utf-8")
