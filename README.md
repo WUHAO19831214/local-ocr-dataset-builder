@@ -25,7 +25,7 @@ OCR 运行依赖现有环境，只读取和调用，不修改：
 
 ### 高精度公式复核
 
-处理模式选“高精度公式复核”时，先运行 Docling 公式增强，再用本机已有的 PaddleOCR-VL 1.6 对疑似行内公式、公式块及含符号的短选项按原 PDF 位置裁图重识别。只有包含可复现数学结构、且中文主体变化不过大的结果会写回 Markdown/JSON，并用于生成可编辑 Word。完整原始 OCR 保存在 `output_name_原始OCR.md/json`；每处原文、新候选、是否采用和原 PDF 裁图保存在 `output_name_公式复核.json` 与 `formula_regions/`。由于模型可能误认上下标及字符，仍应逐项对照裁图检查。
+处理模式选“高精度公式复核”时，先运行 Docling 公式增强，再用本机已有的 PaddleOCR-VL 1.6 对疑似行内公式、公式块及含符号的短选项按原 PDF 位置裁图重识别。若同一行的 A–D 选项有一个被误分成图片，还会整行重识别并恢复为四个可编辑公式。含有图片 HTML 或错误数学分隔符的候选不会写回。只有包含可复现数学结构、且中文主体变化不过大的结果会写回 Markdown/JSON，并用于生成可编辑 Word。完整原始 OCR 保存在 `output_name_原始OCR.md/json`；每处原文、新候选、是否采用和原 PDF 裁图保存在 `output_name_公式复核.json` 与 `formula_regions/`。由于模型可能误认上下标及字符，仍应逐项对照裁图检查。
 
 此模式依赖现有 `/Users/wuhao/LocalProjects/Codex/macbook-air-m2/paddleocr-vl-benchmark/.venv` 和其中缓存的 PaddleOCR-VL 1.6 模型。CPU 上会逐区域运行，整份理科试卷可能需要较长时间。普通与 Docling 公式模式无需这项依赖。
 
