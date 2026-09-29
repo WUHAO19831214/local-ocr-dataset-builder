@@ -95,6 +95,10 @@ def _crop_regions(pdf_path: Path, items: list[dict], output_dir: Path, max_pages
 
 def _clean_candidate(raw: str, item: dict) -> str:
     candidate = raw.strip()
+    # VL sometimes appends a layout crop as HTML after otherwise useful text.
+    # Docling stores real figures separately; this temporary imgs/ reference
+    # cannot be resolved by the dataset exporter.
+    candidate = re.sub(r'<div\b[^>]*>\s*<img\b[^>]*src=["\']imgs/[^>]*>\s*</div>', '', candidate, flags=re.I)
     candidate = re.sub(r"^#{1,6}\s*", "", candidate)
     candidate = " ".join(candidate.split())
     marker = re.match(r"^\s*([A-F])[.．、]", item.get("orig", "") or item.get("text", ""))

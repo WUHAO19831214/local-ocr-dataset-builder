@@ -30,6 +30,12 @@ class FormulaEnhancerTests(unittest.TestCase):
         self.assertFalse(_accept_candidate("B.9", broken, "list_item")[0])
         self.assertFalse(_accept_candidate("B.9", r"B. $\frac{U_2^2}{U_1}$$", "list_item")[0])
 
+    def test_candidate_drops_temporary_layout_image_html(self) -> None:
+        raw = (r"入射角为 $\theta$。 "
+               '<div style="text-align: center;"><img src="imgs/crop.jpg" alt="Image" /></div>')
+        self.assertEqual(_clean_candidate(raw, {"label": "text", "text": "入射角为0。"}),
+                         r"入射角为 $\theta$。")
+
     def test_whole_option_row_restores_four_editable_formulas(self) -> None:
         row = ("①电压 $U_3$ 为 ___。\n"
                r"A. $2U_{2}-U_{1}$ B. $\frac{U_{2}^{2}}{U_{1}}$ "
