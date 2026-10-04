@@ -25,7 +25,7 @@ OCR 运行依赖现有环境，只读取和调用，不修改：
 
 ### 高精度公式复核
 
-处理模式选“高精度公式复核”时，Docling 先做一次基础 OCR，同时输出 Markdown 和 JSON；随后用本机已有的 PaddleOCR-VL 1.6 对疑似行内公式、公式块及含符号的短选项按原 PDF 位置裁图重识别。本机的 Docling CodeFormulaV2 会在公式密集的页面长时间占用 CPU，因此这一模式跳过它；单独的“物理/数学公式优先”模式仍使用 Docling 公式增强，并有 10 分钟的单文档处理上限。若同一行的 A–D 选项有一个被误分成图片，还会整行重识别并恢复为四个可编辑公式。含有图片 HTML 或错误数学分隔符的候选不会写回。只有包含可复现数学结构、且中文主体变化不过大的结果会写回 Markdown/JSON，并用于生成可编辑 Word。完整原始 OCR 保存在 `output_name_原始OCR.md/json`；每处原文、新候选、是否采用和原 PDF 裁图保存在 `output_name_公式复核.json` 与 `formula_regions/`。由于模型可能误认上下标及字符，仍应逐项对照裁图检查。
+处理模式选“高精度公式复核”时，Docling 先做一次基础 OCR，同时输出 Markdown 和 JSON；随后用本机已有的 PaddleOCR-VL 1.6 对公式框、疑似损坏的段内分式及含符号的短选项按原 PDF 位置裁图重识别。只截到公式编号的窄框会向左扩展到完整公式；无法可靠转成 LaTeX 的独立公式会在可编辑 Word 中保留原图，并在复核记录中标明。本机的 Docling CodeFormulaV2 会在公式密集的页面长时间占用 CPU，因此这一模式跳过它；单独的“物理/数学公式优先”模式仍使用 Docling 公式增强，并有 10 分钟的单文档处理上限。若同一行的 A–D 选项有一个被误分成图片，还会整行重识别并恢复为四个可编辑公式。含有图片 HTML 或错误数学分隔符的候选不会写回。只有包含可复现数学结构、且中文主体变化不过大的结果会写回 Markdown/JSON，并用于生成可编辑 Word；Pandoc 将这些数学片段写成 Word 原生 OMML 公式，无需 MathType。完整原始 OCR 保存在 `output_name_原始OCR.md/json`；每处原文、新候选、是否采用和原 PDF 裁图保存在 `output_name_公式复核.json` 与 `formula_regions/`。由于模型可能误认上下标及字符，仍应逐项对照裁图检查。
 
 关闭桌面 App 时会终止由它启动的 Docling/PaddleOCR-VL 子进程，避免重启后旧任务继续占用 CPU。
 

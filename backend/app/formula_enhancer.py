@@ -47,6 +47,38 @@ def _should_revisit(item: dict) -> bool:
     return bool(len(value) <= 120 and LATIN_OR_GREEK.search(value) and EXPLICIT_MATH.search(value))
 
 
+def _leftmost_formula_ink(page: pymupdf.Page, marker: pymupdf.Rect) -> float | None:
+    """Find an equation printed to the left of a narrow numbered formula box."""
+    search = pymupdf.Rect(max(0, page.rect.width * 0.1), marker.y0 - 5,
+                          marker.x0 - 8, marker.y1 + 5) & page.rect
+    if search.width < 20:
+        return None
+    scale = 2
+    pixels = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), clip=search,
+                             colorspace=pymupdf.csGRAY, alpha=False)
+    for x in range(pixels.width):
+        dark = sum(pixels.samples[y * pixels.stride + x] < 170 for y in range(pixels.height))
+        if dark >= 3:
+            return search.x0 + x / scale
+    return None
+
+
+def _formula_region_rects(page: pymupdf.Page, rect: pymupdf.Rect) -> tuple[pymupdf.Rect, pymupdf.Rect]:
+    """Keep existing formula boxes; widen boxes that contain only the equation number."""
+    if rect.width < max(32, page.rect.width * 0.07) and rect.x0 > page.rect.width * 0.7:
+        leftmost = _leftmost_formula_ink(page, rect)
+        if leftmost is not None and leftmost < rect.x0 - 12:
+            left = max(0, leftmost - 6)
+            equation = pymupdf.Rect(left, rect.y0 - 6, rect.x0 - 5, rect.y1 + 6) & page.rect
+            visual = pymupdf.Rect(left, rect.y0 - 6, rect.x1 + 5, rect.y1 + 6) & page.rect
+            return equation, visual
+    top_pad = max(4, rect.height * 0.15)
+    bottom_pad = max(14, rect.height * 0.55)
+    visual = pymupdf.Rect(rect.x0 - 3, rect.y0 - top_pad,
+                          rect.x1 + 4, rect.y1 + bottom_pad) & page.rect
+    return visual, visual
+
+
 def _crop_regions(pdf_path: Path, items: list[dict], output_dir: Path, max_pages: int | None) -> list[dict]:
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest: list[dict] = []
@@ -90,16 +122,103 @@ def _crop_regions(pdf_path: Path, items: list[dict], output_dir: Path, max_pages
                         max(value.x1 for _, value in peers), max(value.y1 for _, value in peers),
                     )
                     crop_name = f"page-{page_number:02d}-options-{min(i for i, _ in peers):04d}.png"
-            top_pad = max(4, rect.height * 0.15) if item.get("label") == "formula" else 2
-            bottom_pad = max(14, rect.height * 0.55) if item.get("label") == "formula" else 2
-            rect = pymupdf.Rect(rect.x0 - 3, rect.y0 - top_pad, rect.x1 + 4, rect.y1 + bottom_pad) & page.rect
+            fallback_rect = None
+            if item.get("label") == "formula":
+                rect, fallback_rect = _formula_region_rects(page, rect)
+            else:
+                rect = pymupdf.Rect(rect.x0 - 3, rect.y0 - 2, rect.x1 + 4, rect.y1 + 2) & page.rect
             if rect.width < 8 or rect.height < 5:
                 continue
             crop_path = output_dir / crop_name
-            if not crop_path.is_file():
-                page.get_pixmap(matrix=pymupdf.Matrix(4, 4), clip=rect, alpha=False).save(str(crop_path))
-            manifest.append({"index": index, "page": page_number, "crop": str(crop_path)})
+            page.get_pixmap(matrix=pymupdf.Matrix(4, 4), clip=rect, alpha=False).save(str(crop_path))
+            entry = {"index": index, "page": page_number, "crop": str(crop_path)}
+            if fallback_rect is not None:
+                fallback_path = output_dir / crop_name.replace(".png", "-fallback.png")
+                page.get_pixmap(matrix=pymupdf.Matrix(4, 4), clip=fallback_rect,
+                                alpha=False).save(str(fallback_path))
+                entry["fallback_crop"] = str(fallback_path)
+            manifest.append(entry)
     return manifest
+
+
+def _needs_inline_line_review(item: dict) -> bool:
+    text = item.get("text", "")
+    return (item.get("label") in {"text", "list_item"} and bool(item.get("prov"))
+            and 20 <= len(text) <= 240 and text.count("_") >= 2
+            and bool(LATIN_OR_GREEK.search(text)))
+
+
+def _ink_line_ranges(page: pymupdf.Page, rect: pymupdf.Rect) -> list[tuple[float, float]]:
+    scale = 2
+    pixels = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), clip=rect,
+                             colorspace=pymupdf.csGRAY, alpha=False)
+    threshold = max(8, pixels.width // 50)
+    active = [y for y in range(pixels.height)
+              if sum(pixels.samples[y * pixels.stride + x] < 170 for x in range(pixels.width)) >= threshold]
+    ranges: list[list[int]] = []
+    for y in active:
+        if not ranges or y - ranges[-1][1] > 8:
+            ranges.append([y, y])
+        else:
+            ranges[-1][1] = y
+    return [(rect.y0 + start / scale, rect.y0 + end / scale)
+            for start, end in ranges if end - start >= 8]
+
+
+def _has_fill_blank(pixels: pymupdf.Pixmap) -> bool:
+    """A long printed rule is a fill-in blank, not a short fraction bar."""
+    minimum = max(70, pixels.width // 12)
+    for y in range(pixels.height):
+        run = 0
+        for x in range(pixels.width):
+            if pixels.samples[y * pixels.stride + x] < 160:
+                run += 1
+                if run >= minimum:
+                    return True
+            else:
+                run = 0
+    return False
+
+
+def _inline_line_regions(pdf_path: Path, items: list[dict], output_dir: Path,
+                         max_pages: int | None) -> list[dict]:
+    """Review short printed lines when OCR has collapsed inline math into underscores."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    regions: list[dict] = []
+    with pymupdf.open(str(pdf_path)) as pdf:
+        for index, item in enumerate(items):
+            if not _needs_inline_line_review(item):
+                continue
+            provenance = item["prov"][0]
+            page_number = provenance["page_no"]
+            if (max_pages is not None and page_number > max_pages) or not 1 <= page_number <= pdf.page_count:
+                continue
+            page = pdf[page_number - 1]
+            box = provenance["bbox"]
+            top, bottom = ((page.rect.height - box["t"], page.rect.height - box["b"])
+                           if box.get("coord_origin") == "BOTTOMLEFT" else (box["t"], box["b"]))
+            rect = pymupdf.Rect(box["l"], top, box["r"], bottom) & page.rect
+            if rect.height < 30 or rect.width < 60:
+                continue
+            lines = _ink_line_ranges(page, rect)
+            if not 2 <= len(lines) <= 10:
+                continue
+            for position, (line_top, line_bottom) in enumerate(lines):
+                top_pad = 4 if position == 0 else 12  # include fraction numerators above the text baseline
+                crop_rect = pymupdf.Rect(rect.x0 - 3, line_top - top_pad, rect.x1 + 3,
+                                         line_bottom + 4) & page.rect
+                crop_path = output_dir / f"page-{page_number:02d}-inline-{index:04d}-{position:02d}.png"
+                pixels = page.get_pixmap(matrix=pymupdf.Matrix(4, 4), clip=crop_rect,
+                                         colorspace=pymupdf.csGRAY, alpha=False)
+                page.get_pixmap(matrix=pymupdf.Matrix(4, 4), clip=crop_rect,
+                                alpha=False).save(str(crop_path))
+                regions.append({"index": f"inline-{index}-{position}", "text_index": index,
+                                "line_position": position, "page": page_number,
+                                "crop": str(crop_path), "kind": "inline_line",
+                                "has_fill_blank": _has_fill_blank(pixels)})
+            if len(regions) >= 30:
+                break
+    return regions
 
 
 def _clean_candidate(raw: str, item: dict) -> str:
@@ -125,6 +244,11 @@ def _clean_candidate(raw: str, item: dict) -> str:
             candidate = (math_span.group(1) or math_span.group(2)).strip()
         else:
             candidate = re.sub(r"^\$\$?\s*|\s*\$\$?$", "", candidate).strip()
+            if CJK.search(candidate):
+                prefix = candidate[:CJK.search(candidate).start()].strip()
+                prefix = re.sub(r"[①-⑳].*$", "", prefix).strip()
+                if "=" in prefix and len(prefix) >= 3 and _balanced_math(prefix):
+                    candidate = prefix
     else:
         # Docling list items can store the list marker in ``orig`` only. Its
         # Markdown exporter adds that marker, so do not also put it in text.
@@ -134,6 +258,59 @@ def _clean_candidate(raw: str, item: dict) -> str:
         if marker and not old_text_has_marker and new_marker and marker.group(1) == new_marker.group(1):
             candidate = candidate[new_marker.end():]
     return candidate
+
+
+def _combine_inline_lines(entries: list[dict], results: dict[str, str]) -> str:
+    lines = []
+    for entry in sorted(entries, key=lambda value: value["line_position"]):
+        raw = results.get(str(entry["index"]), "")
+        if re.search(r"<\s*/?\s*(?:div|img)\b|!\[[^]]*\]\(", raw, re.I):
+            return ""
+        line = re.sub(r"^\s*#{1,6}\s*", "", raw.strip())
+        line = " ".join(line.split())
+        if not line or line.count("$") % 2 or "$$" in line:
+            return ""
+        if entry.get("has_fill_blank") and "___" not in line and re.search(r"[A-Za-z]\s*$", line):
+            line += "___"
+        lines.append(line)
+    return "".join(lines)
+
+
+def _restore_dropped_chinese(original: str, candidate: str) -> str:
+    """Keep multi-character prose that a line OCR omitted beside a blank rule."""
+    old_chars = "".join(CJK.findall(original))
+    new_chars = "".join(CJK.findall(candidate))
+    positions = [match.start() for match in CJK.finditer(candidate)]
+    additions: list[tuple[int, str]] = []
+    for tag, old_start, old_end, new_start, _ in SequenceMatcher(None, old_chars, new_chars).get_opcodes():
+        missing = old_chars[old_start:old_end]
+        if tag == "delete" and len(missing) >= 2 and missing not in candidate:
+            point = positions[new_start] if new_start < len(positions) else len(candidate)
+            additions.append((point, missing))
+    for point, missing in reversed(additions):
+        candidate = candidate[:point] + missing + candidate[point:]
+    return candidate
+
+
+def _normalize_repeated_resistance_fraction(candidate: str) -> str:
+    """Resolve OCR's I/r confusion only when the same resistance fraction repeats."""
+    if ("电流表" in candidate and "电阻" in candidate and "电压" in candidate
+            and candidate.count(r"\frac{U}{I}") == 1
+            and candidate.count(r"\frac{U}{r}") == 1):
+        return candidate.replace(r"\frac{U}{r}", r"\frac{U}{I}")
+    return candidate
+
+
+def _balanced_math(value: str) -> bool:
+    pairs = {")": "(", "]": "[", "}": "{"}
+    stack: list[str] = []
+    for character in value:
+        if character in "([{":
+            stack.append(character)
+        elif character in pairs:
+            if not stack or stack.pop() != pairs[character]:
+                return False
+    return not stack
 
 
 def _accept_candidate(old: str, new: str, label: str) -> tuple[bool, str]:
@@ -149,6 +326,8 @@ def _accept_candidate(old: str, new: str, label: str) -> tuple[bool, str]:
         return False, "结果没有可复现的数学结构"
     if label == "formula" and CJK.search(new):
         return False, "公式候选混入正文，需人工复核"
+    if label == "formula" and not _balanced_math(new):
+        return False, "公式括号或结构不完整，需人工复核"
     old_cjk = "".join(CJK.findall(old))
     new_cjk = "".join(CJK.findall(new))
     if len(old_cjk) >= 4 and SequenceMatcher(None, old_cjk, new_cjk).ratio() < 0.62:
@@ -156,6 +335,13 @@ def _accept_candidate(old: str, new: str, label: str) -> tuple[bool, str]:
     if label != "formula" and "$" not in new:
         return False, "行内公式缺少数学分隔符"
     return True, "自动采用；仍建议对照裁图检查"
+
+
+def _accept_inline_line_candidate(old: str, new: str, label: str) -> tuple[bool, str]:
+    accepted, reason = _accept_candidate(old, new, label)
+    if accepted and old.count("_") >= 3 and new.count(r"\frac") < 2:
+        return False, "段内多处疑似分式未完整识别，保留原文供复核"
+    return accepted, reason
 
 
 def _option_label(item: dict) -> str | None:
@@ -325,6 +511,50 @@ def _read_paddle_output(process: subprocess.Popen, log: Callable[[str], None]) -
             log(line)
 
 
+def _ordered_blank_formulas(data: dict) -> list[int]:
+    ordered: list[int] = []
+
+    def visit(children: list[dict]) -> None:
+        for child in children:
+            ref = child.get("$ref", "")
+            parts = ref.strip("#/").split("/")
+            if len(parts) != 2 or not parts[1].isdigit():
+                continue
+            kind, index = parts[0], int(parts[1])
+            if kind == "texts":
+                item = data["texts"][index]
+                if item.get("label") == "formula" and not item.get("text", "").strip():
+                    ordered.append(index)
+            elif kind == "groups":
+                visit(data["groups"][index].get("children", []))
+
+    visit(data["body"].get("children", []))
+    return ordered
+
+
+def _insert_visual_formula_fallbacks(md_path: Path, data: dict, fallback_paths: dict[int, str]) -> int:
+    """Keep an unrecognized equation visible without altering accepted native math."""
+    markdown = md_path.read_text(encoding="utf-8")
+    marker = "<!-- formula-not-decoded -->"
+    ordered = _ordered_blank_formulas(data)
+    if markdown.count(marker) != len(ordered):
+        return 0
+    inserted = 0
+    for index in ordered:
+        replacement = marker
+        if index in fallback_paths:
+            image_path = md_path.parent / fallback_paths[index]
+            width_attribute = ""
+            if image_path.is_file():
+                width_attribute = f"{{width={pymupdf.Pixmap(str(image_path)).width / 4:.1f}pt}}"
+            replacement = f"![未识别公式原图]({fallback_paths[index]}){width_attribute}"
+            inserted += 1
+        markdown = markdown.replace(marker, replacement, 1)
+    if inserted:
+        md_path.write_text(markdown, encoding="utf-8")
+    return inserted
+
+
 def enhance_formula_regions(
     pdf_path: Path,
     dataset_dir: Path,
@@ -344,6 +574,7 @@ def enhance_formula_regions(
     items = data["texts"]
     crops_dir = dataset_dir / "formula_regions"
     manifest = _crop_regions(pdf_path, items, crops_dir, max_pages)
+    manifest.extend(_inline_line_regions(pdf_path, items, crops_dir, max_pages))
     manifest.extend(_option_rows(pdf_path, data, crops_dir, max_pages))
     log(f"待复核区域：{len(manifest)} 处；裁图保存在 formula_regions/")
     report_path = dataset_dir / f"{output_name}_公式复核.json"
@@ -373,7 +604,12 @@ def enhance_formula_regions(
 
     report: list[dict] = []
     accepted = 0
+    fallback_paths: dict[int, str] = {}
+    inline_groups: dict[int, list[dict]] = {}
     for entry in manifest:
+        if entry.get("kind") == "inline_line":
+            inline_groups.setdefault(entry["text_index"], []).append(entry)
+            continue
         if entry.get("kind") == "option_row":
             parsed = _parse_option_row(results.get(str(entry["index"]), ""))
             use = bool(parsed) and _apply_option_row(data, entry, parsed)
@@ -392,6 +628,8 @@ def enhance_formula_regions(
         if use:
             item["text"] = candidate
             accepted += 1
+        elif item.get("label") == "formula" and not original.strip() and entry.get("fallback_crop"):
+            fallback_paths[index] = str(Path(entry["fallback_crop"]).relative_to(dataset_dir))
         report.append({
             "text_index": index,
             "page": entry["page"],
@@ -400,20 +638,38 @@ def enhance_formula_regions(
             "candidate": candidate,
             "accepted": use,
             "reason": reason,
+            "visual_fallback": fallback_paths.get(index),
         })
+    for index, entries in inline_groups.items():
+        item = items[index]
+        original = item.get("text", "")
+        candidate = _combine_inline_lines(entries, results)
+        if candidate:
+            candidate = _restore_dropped_chinese(original, candidate)
+            candidate = _normalize_repeated_resistance_fraction(candidate)
+        use, reason = _accept_inline_line_candidate(original, candidate, item.get("label", ""))
+        if use:
+            item["text"] = candidate
+            accepted += 1
+        report.append({"text_index": index, "page": entries[0]["page"],
+                       "crops": [str(Path(entry["crop"]).relative_to(dataset_dir)) for entry in entries],
+                       "original": original, "candidate": candidate, "accepted": use,
+                       "reason": reason})
     report_path.write_text(json.dumps({"regions": report, "accepted": accepted}, ensure_ascii=False, indent=2), encoding="utf-8")
-    log(f"自动采用 {accepted}/{len(manifest)} 处；逐项记录：{report_path.name}")
-    if accepted:
+    log(f"自动采用 {accepted}/{len(report)} 处；逐项记录：{report_path.name}")
+    if accepted or fallback_paths:
         shutil.copy2(json_path, dataset_dir / f"{output_name}_原始OCR.json")
         shutil.copy2(md_path, dataset_dir / f"{output_name}_原始OCR.md")
-        json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        export = subprocess.run(
-            [str(DOCLING_PYTHON), str(Path(__file__).with_name("formula_md_worker.py")), str(json_path), str(md_path)],
-            capture_output=True, text=True, timeout=120,
-        )
-        if export.returncode:
-            shutil.copy2(dataset_dir / f"{output_name}_原始OCR.json", json_path)
-            shutil.copy2(dataset_dir / f"{output_name}_原始OCR.md", md_path)
-            raise RuntimeError(f"公式 Markdown 重建失败：{export.stderr.strip()}")
-        log("已更新 md/json，原始 OCR 已备份")
+        if accepted:
+            json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            export = subprocess.run(
+                [str(DOCLING_PYTHON), str(Path(__file__).with_name("formula_md_worker.py")), str(json_path), str(md_path)],
+                capture_output=True, text=True, timeout=120,
+            )
+            if export.returncode:
+                shutil.copy2(dataset_dir / f"{output_name}_原始OCR.json", json_path)
+                shutil.copy2(dataset_dir / f"{output_name}_原始OCR.md", md_path)
+                raise RuntimeError(f"公式 Markdown 重建失败：{export.stderr.strip()}")
+        inserted = _insert_visual_formula_fallbacks(md_path, data, fallback_paths)
+        log(f"已更新 md/json，原始 OCR 已备份；未识别公式保留原图 {inserted} 处")
     return report_path

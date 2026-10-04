@@ -211,7 +211,7 @@ onBeforeUnmount(() => {
           物理/数学公式优先模式使用 Docling 公式增强；在本机处理公式较多的 PDF 时可能较慢，单份 PDF 最长运行 10 分钟。
         </p>
         <p v-if="form.process_mode === 'formula_vl'" class="mode-hint">
-          高精度复核先做一次基础 OCR，再用本机 PaddleOCR-VL 复核疑似公式并保存裁图与逐项记录；已跳过在本机过慢的 Docling CodeFormulaV2。
+          高精度复核先做一次基础 OCR，再用本机 PaddleOCR-VL 复核公式及疑似损坏的段内分式；未能识别的独立公式保留原图。可编辑 Word 使用 Word 原生公式，无需 MathType。
         </p>
         <p v-if="form.export_word" class="mode-hint">
           原版式 Word 每页是一张原 PDF 页面图片，版式与公式外观保真；可编辑 Word 使用 OCR 结果，识别错误仍需校对。
