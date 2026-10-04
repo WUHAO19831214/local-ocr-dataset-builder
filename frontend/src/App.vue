@@ -207,8 +207,11 @@ onBeforeUnmount(() => {
           </label>
         </div>
 
-        <p v-if="form.process_mode !== 'normal'" class="mode-hint">
-          公式模式会启用 Docling 公式增强。高精度复核还会针对疑似行内公式和公式块调用本机 PaddleOCR-VL，保存裁图与逐项复核记录；处理时间可能明显增加。
+        <p v-if="form.process_mode === 'formula'" class="mode-hint">
+          物理/数学公式优先模式使用 Docling 公式增强；在本机处理公式较多的 PDF 时可能较慢，单份 PDF 最长运行 10 分钟。
+        </p>
+        <p v-if="form.process_mode === 'formula_vl'" class="mode-hint">
+          高精度复核先做一次基础 OCR，再用本机 PaddleOCR-VL 复核疑似公式并保存裁图与逐项记录；已跳过在本机过慢的 Docling CodeFormulaV2。
         </p>
         <p v-if="form.export_word" class="mode-hint">
           原版式 Word 每页是一张原 PDF 页面图片，版式与公式外观保真；可编辑 Word 使用 OCR 结果，识别错误仍需校对。
@@ -234,7 +237,7 @@ onBeforeUnmount(() => {
             <Clipboard :size="17" />
             <span>{{ copied ? '已复制' : '复制路径' }}</span>
           </button>
-          <button type="button" @click="openOutputPath" :disabled="!outputPath" title="在 Finder 打开输出目录">
+          <button type="button" @click="openOutputPath" :disabled="job?.status !== 'success'" title="处理完成后在 Finder 打开输出目录">
             <ExternalLink :size="17" />
             <span>打开目录</span>
           </button>

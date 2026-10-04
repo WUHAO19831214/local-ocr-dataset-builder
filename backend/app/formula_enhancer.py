@@ -5,37 +5,46 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import tempfile
+import time
 from copy import deepcopy
 from difflib import SequenceMatcher
 from pathlib import Path
+from queue import Empty, Queue
+from threading import Thread
 from typing import Callable
 
 import pymupdf
 
+from .process_registry import register_process, unregister_process
+
 
 PADDLE_PYTHON = Path("/Users/wuhao/LocalProjects/Codex/macbook-air-m2/paddleocr-vl-benchmark/.venv/bin/python")
 DOCLING_PYTHON = Path("/Users/wuhao/my-pdf-tool/my-pdf-tool/venv/bin/python")
+PADDLE_TIMEOUT_SECONDS = 2700
 MATH_MARKER = re.compile(r"\\(?:frac|sqrt|Delta|theta|phi|lambda|pi|sin|cos|mathrm|text|sum|int|begin)|[\^_=<>≤≥]", re.I)
 CJK = re.compile(r"[\u3400-\u9fff]")
 LATIN_OR_GREEK = re.compile(r"[A-Za-zα-ωΑ-Ω∆Δ]")
-MIXED_MATH = re.compile(r"\d|[=<>＞＜＋+−*/^_]|[∆Δφθλπ]")
+EXPLICIT_MATH = re.compile(r"\$|\\(?:frac|sqrt|Delta|theta|phi|lambda|pi|sum|int)|[=<>≤≥^]")
 
 
 def _should_revisit(item: dict) -> bool:
     label = item.get("label")
     value = item.get("text", "").strip()
-    if not value or not item.get("prov"):
+    if not item.get("prov"):
         return False
     if label == "formula":
         return True
+    if not value:
+        return False
     if label not in {"text", "list_item"}:
         return False
-    if label == "list_item" and len(value) <= 35 and LATIN_OR_GREEK.search(value):
+    if label == "list_item" and len(value) <= 35 and re.match(r"^\s*[A-F][.．、]", value):
         return True
-    return bool(LATIN_OR_GREEK.search(value) and MIXED_MATH.search(value))
+    return bool(len(value) <= 120 and LATIN_OR_GREEK.search(value) and EXPLICIT_MATH.search(value))
 
 
 def _crop_regions(pdf_path: Path, items: list[dict], output_dir: Path, max_pages: int | None) -> list[dict]:
@@ -111,7 +120,11 @@ def _clean_candidate(raw: str, item: dict) -> str:
         end = choices[matching + 1].start() if matching + 1 < len(choices) else len(candidate)
         candidate = candidate[start:end].strip()
     if item.get("label") == "formula":
-        candidate = re.sub(r"^\$\$?\s*|\s*\$\$?$", "", candidate).strip()
+        math_span = re.search(r"\$\$([^$]+)\$\$|\$([^$]+)\$", candidate)
+        if math_span:
+            candidate = (math_span.group(1) or math_span.group(2)).strip()
+        else:
+            candidate = re.sub(r"^\$\$?\s*|\s*\$\$?$", "", candidate).strip()
     else:
         # Docling list items can store the list marker in ``orig`` only. Its
         # Markdown exporter adds that marker, so do not also put it in text.
@@ -134,6 +147,8 @@ def _accept_candidate(old: str, new: str, label: str) -> tuple[bool, str]:
         return False, "数学分隔符不成对"
     if not MATH_MARKER.search(new):
         return False, "结果没有可复现的数学结构"
+    if label == "formula" and CJK.search(new):
+        return False, "公式候选混入正文，需人工复核"
     old_cjk = "".join(CJK.findall(old))
     new_cjk = "".join(CJK.findall(new))
     if len(old_cjk) >= 4 and SequenceMatcher(None, old_cjk, new_cjk).ratio() < 0.62:
@@ -267,6 +282,49 @@ def _apply_option_row(data: dict, row: dict, parsed: dict[str, str]) -> bool:
     return True
 
 
+def _read_paddle_output(process: subprocess.Popen, log: Callable[[str], None]) -> int:
+    assert process.stdout is not None
+    lines: Queue[str | None] = Queue()
+
+    def read_lines() -> None:
+        try:
+            for line in process.stdout:
+                lines.put(line.strip())
+        finally:
+            lines.put(None)
+
+    Thread(target=read_lines, daemon=True).start()
+    started = time.monotonic()
+    current_region = "模型加载中"
+    while True:
+        elapsed = time.monotonic() - started
+        if elapsed >= PADDLE_TIMEOUT_SECONDS:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+            raise RuntimeError("PaddleOCR-VL 超过 45 分钟仍未完成；已停止复核，原始 OCR 文件保留。")
+        try:
+            line = lines.get(timeout=min(30, PADDLE_TIMEOUT_SECONDS - elapsed))
+        except Empty:
+            log(f"PaddleOCR-VL 仍在运行：{current_region}，已耗时 {int(time.monotonic() - started)} 秒")
+            continue
+        if line is None:
+            return process.wait()
+        if line.startswith("REGION_START"):
+            current_region = line.removeprefix("REGION_START").strip()
+        if line.startswith(("MODEL_LOADING", "MODEL_READY", "REGION_START", "REGION ", "ERROR ")):
+            log(line)
+
+
 def enhance_formula_regions(
     pdf_path: Path,
     dataset_dir: Path,
@@ -302,15 +360,14 @@ def enhance_formula_regions(
         env["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
         env["PYTHONUNBUFFERED"] = "1"
         command = [str(PADDLE_PYTHON), str(Path(__file__).with_name("formula_vl_worker.py")), str(manifest_path), str(result_path)]
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env, bufsize=1)
-        assert process.stdout is not None
-        for line in process.stdout:
-            line = line.strip()
-            if line.startswith("REGION "):
-                log(line)
-            elif line.startswith("ERROR "):
-                log(line)
-        if process.wait() != 0 or not result_path.is_file():
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, env=env, bufsize=1, start_new_session=True)
+        register_process(process)
+        try:
+            return_code = _read_paddle_output(process, log)
+        finally:
+            unregister_process(process)
+        if return_code != 0 or not result_path.is_file():
             raise RuntimeError("PaddleOCR-VL 公式复核失败；原 OCR 文件未被修改")
         results = json.loads(result_path.read_text(encoding="utf-8"))
 

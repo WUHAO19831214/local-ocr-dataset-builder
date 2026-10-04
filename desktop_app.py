@@ -9,6 +9,7 @@ import uvicorn
 import webview
 
 from backend.app.main import app
+from backend.app.process_registry import stop_active_processes
 
 
 APP_TITLE = "Local OCR Dataset Builder"
@@ -49,10 +50,10 @@ def main() -> None:
     try:
         webview.start()
     finally:
+        stop_active_processes()
         server.should_exit = True
         server_thread.join(timeout=5)
 
 
 if __name__ == "__main__":
     main()
-

@@ -13,17 +13,20 @@ from paddleocr import PaddleOCRVL
 def main() -> int:
     manifest_path, result_path = map(Path, sys.argv[1:3])
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    print(f"MODEL_LOADING · {len(manifest)} regions", flush=True)
     pipeline = PaddleOCRVL(
         pipeline_version="v1.6",
         device="cpu",
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
     )
+    print("MODEL_READY", flush=True)
     results: dict[str, str] = {}
     crop_cache: dict[str, str] = {}
     with tempfile.TemporaryDirectory(prefix="paddle-formula-output-") as tmp:
         for position, region in enumerate(manifest, start=1):
             index = region["index"]
+            print(f"REGION_START {position}/{len(manifest)} · P{region['page']} · #{index}", flush=True)
             try:
                 if region["crop"] not in crop_cache:
                     for result in pipeline.predict(input=region["crop"]):

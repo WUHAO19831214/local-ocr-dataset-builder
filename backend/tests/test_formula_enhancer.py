@@ -1,11 +1,45 @@
 from __future__ import annotations
 
 import unittest
+import subprocess
+import sys
+from unittest.mock import patch
 
-from backend.app.formula_enhancer import _accept_candidate, _apply_option_row, _clean_candidate, _parse_option_row
+from backend.app.formula_enhancer import _accept_candidate, _apply_option_row, _clean_candidate, _parse_option_row, _read_paddle_output, _should_revisit
 
 
 class FormulaEnhancerTests(unittest.TestCase):
+    def test_silent_paddle_worker_is_stopped_at_hard_timeout(self) -> None:
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                   stdout=subprocess.PIPE, text=True, start_new_session=True)
+        try:
+            with patch("backend.app.formula_enhancer.PADDLE_TIMEOUT_SECONDS", 0.2):
+                with self.assertRaises(RuntimeError):
+                    _read_paddle_output(process, lambda _: None)
+            self.assertIsNotNone(process.poll())
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+            if process.stdout is not None:
+                process.stdout.close()
+
+    def test_empty_formula_box_is_sent_to_paddle(self) -> None:
+        self.assertTrue(_should_revisit({"label": "formula", "text": "", "prov": [{"page_no": 1}]}))
+
+    def test_long_physics_prose_without_formula_structure_is_not_sent_to_paddle(self) -> None:
+        item = {"label": "list_item", "text": "欲使P和Q断开后，弹簧的最大弹性势能等于2.2mgR，Q的质量应为多大？",
+                "prov": [{"page_no": 1}]}
+        self.assertFalse(_should_revisit(item))
+        item["text"] = r"A. $\frac{U_1}{U_2}$"
+        self.assertTrue(_should_revisit(item))
+
+    def test_formula_crop_keeps_only_math_when_paddle_appends_page_text(self) -> None:
+        raw = '$ W = mgR $\n<div style="text-align: center;"><img src="imgs/img_in_image_box_1.jpg" alt="Image" /></div>\n误入的正文'
+        candidate = _clean_candidate(raw, {"label": "formula", "text": ""})
+        self.assertEqual(candidate, "W = mgR")
+        self.assertTrue(_accept_candidate("", candidate, "formula")[0])
+
     def test_option_row_extracts_target_and_keeps_docling_marker(self) -> None:
         row = (
             r"A. $^{1}_{0}n$ B. $3_{0}^{1}n$ "

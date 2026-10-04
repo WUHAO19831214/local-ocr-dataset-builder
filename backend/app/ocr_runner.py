@@ -3,12 +3,19 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
+import time
 from pathlib import Path
+from queue import Empty, Queue
+from threading import Thread
 from typing import Callable, Iterable
 
+import pymupdf
+
 from .models import StartJobRequest
+from .process_registry import register_process, unregister_process
 from .word_exporter import export_word_files
 from .formula_enhancer import PADDLE_PYTHON, enhance_formula_regions
 
@@ -25,6 +32,7 @@ ALLOWED_LANGS = {
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 OUTPUT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 FORMULA_BLOCK_RE = re.compile(r"\$\$(.*?)\$\$", re.DOTALL)
+DOCLING_TIMEOUT_SECONDS = 600
 MATH_SPAN_RE = re.compile(r"(\$\$.*?\$\$|\$.*?\$)", re.DOTALL)
 PA_POWER_RE = re.compile(
     r"(?<![\w$])(?:10\s*\^\s*(?P<caret>-?\s*\d{1,2})\s*Pa\b|"
@@ -85,25 +93,24 @@ def run_ocr_job(request: StartJobRequest, log: Callable[[str], None], stage: Cal
     mode_names = {"normal": "普通教材 OCR", "formula": "Docling 公式增强", "formula_vl": "高精度公式复核"}
     log(f"处理模式：{mode_names[request.process_mode]}")
     log(f"强制 OCR：{'开启' if force_ocr else '关闭'}")
-    log(f"公式增强：{'开启' if request.process_mode != 'normal' else '关闭'}")
+    log(f"Docling 公式增强：{'开启' if request.process_mode == 'formula' else '关闭'}")
+    if request.process_mode == "formula_vl":
+        log("高精度模式使用基础 OCR 后由 PaddleOCR-VL 复核公式，跳过耗时过长的 Docling CodeFormulaV2")
     log(f"目标输出目录：{target_dir}")
 
     with tempfile.TemporaryDirectory(prefix="local-ocr-dataset-builder-") as tmp:
         tmp_root = Path(tmp)
-        md_dir = tmp_root / "docling_md"
-        json_dir = tmp_root / "docling_json"
+        docling_dir = tmp_root / "docling"
 
         stage("markdown")
-        log("开始输出 Markdown")
-        _run_docling(pdf_path, md_dir, "md", request.ocr_lang, request.process_mode, force_ocr, log)
-
-        stage("json")
-        log("开始输出 JSON")
-        _run_docling(pdf_path, json_dir, "json", request.ocr_lang, request.process_mode, force_ocr, log)
+        log("开始解析 PDF，同时输出 Markdown 和 JSON")
+        _run_docling(pdf_path, docling_dir, ("md", "json"), request.ocr_lang,
+                     request.process_mode, force_ocr, log)
 
         stage("normalize")
         log("开始整理 md/json/images")
-        _normalize_outputs(md_dir, json_dir, target_dir, request.output_name, request.process_mode, log)
+        _normalize_outputs(docling_dir, docling_dir, target_dir, request.output_name,
+                           request.process_mode, log)
 
         if request.process_mode == "formula_vl":
             stage("formula_vl")
@@ -124,20 +131,19 @@ def run_ocr_job(request: StartJobRequest, log: Callable[[str], None], stage: Cal
 def _run_docling(
     pdf_path: Path,
     output_dir: Path,
-    output_format: str,
+    output_formats: tuple[str, ...],
     ocr_lang: str,
     process_mode: str,
     force_ocr: bool,
     log: Callable[[str], None],
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
+    timeout_seconds = _docling_timeout_seconds(pdf_path, process_mode)
     command = [
         str(DOCLING_BIN),
         str(pdf_path),
         "--from",
         "pdf",
-        "--to",
-        output_format,
         "--output",
         str(output_dir),
         "--image-export-mode",
@@ -147,10 +153,13 @@ def _run_docling(
         "--ocr-lang",
         ocr_lang,
     ]
+    for output_format in output_formats:
+        command.extend(["--to", output_format])
     if force_ocr:
         command.append("--force-ocr")
-    if process_mode in ("formula", "formula_vl"):
+    if process_mode == "formula":
         command.append("--enrich-formula")
+    command.extend(["--document-timeout", str(timeout_seconds)])
     command.append("-v")
 
     env = os.environ.copy()
@@ -165,17 +174,66 @@ def _run_docling(
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
+    register_process(process)
+    try:
+        return_code = _read_docling_output(process, log, timeout_seconds)
+    finally:
+        unregister_process(process)
+    if return_code != 0:
+        raise OcrRunnerError(f"docling 输出失败（处理上限 {timeout_seconds // 60} 分钟），退出码：{return_code}")
 
+
+def _docling_timeout_seconds(pdf_path: Path, process_mode: str) -> int:
+    if process_mode == "formula":
+        return DOCLING_TIMEOUT_SECONDS
+    try:
+        with pymupdf.open(str(pdf_path)) as document:
+            return max(DOCLING_TIMEOUT_SECONDS, min(3600, document.page_count * 90))
+    except Exception:
+        return DOCLING_TIMEOUT_SECONDS
+
+
+def _read_docling_output(
+    process: subprocess.Popen, log: Callable[[str], None], timeout_seconds: float | None = None,
+) -> int:
+    """Show a heartbeat and enforce a real timeout during silent model inference."""
     assert process.stdout is not None
-    for line in process.stdout:
-        line = line.rstrip()
+    lines: Queue[str | None] = Queue()
+
+    def read_lines() -> None:
+        try:
+            for line in process.stdout:
+                lines.put(line.rstrip())
+        finally:
+            lines.put(None)
+
+    Thread(target=read_lines, daemon=True).start()
+    started = time.monotonic()
+    timeout_seconds = timeout_seconds if timeout_seconds is not None else DOCLING_TIMEOUT_SECONDS
+    while True:
+        elapsed = time.monotonic() - started
+        if elapsed >= timeout_seconds:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            raise OcrRunnerError(f"Docling 已运行 {int(timeout_seconds // 60)} 分钟仍未完成；已停止该次解析。请检查 PDF，或关闭强制 OCR 后重试。")
+        try:
+            line = lines.get(timeout=min(30, timeout_seconds - elapsed))
+        except Empty:
+            log(f"Docling 仍在计算，已耗时 {int(time.monotonic() - started)} 秒")
+            continue
+        if line is None:
+            return process.wait()
         if line:
             log(line)
-
-    return_code = process.wait()
-    if return_code != 0:
-        raise OcrRunnerError(f"docling {output_format} 输出失败，退出码：{return_code}")
 
 
 def _find_one(directory: Path, suffix: str) -> Path:
