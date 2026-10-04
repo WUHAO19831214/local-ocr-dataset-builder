@@ -11,10 +11,12 @@ import pymupdf
 
 from backend.app.formula_enhancer import (_accept_candidate, _accept_inline_line_candidate,
                                           _apply_option_row, _clean_candidate,
-                                          _combine_inline_lines, _formula_region_rects,
+                                          _code_formula_crop, _combine_inline_lines,
+                                          _formula_region_rects,
                                           _insert_visual_formula_fallbacks, _needs_inline_line_review,
                                           _normalize_repeated_resistance_fraction,
                                           _parse_option_row, _read_paddle_output,
+                                          _repair_direct_text_order,
                                           _restore_dropped_chinese, _should_revisit)
 
 
@@ -38,6 +40,21 @@ class FormulaEnhancerTests(unittest.TestCase):
         self.assertEqual(equation.x0, 237)
         self.assertEqual(equation.x1, 520)
         self.assertEqual(equation.y1, 649)
+        pdf.close()
+
+    def test_secondary_formula_crop_keeps_equation_and_vertical_padding(self) -> None:
+        pdf = pymupdf.open()
+        page = pdf.new_page(width=300, height=400)
+        page.insert_text((110, 110), "v0=3/2 sqrt(2gR)")
+        page.insert_text((276, 110), "4")
+        marker = pymupdf.Rect(270, 96, 290, 115)
+        equation, _ = _formula_region_rects(page, marker)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "code.png"
+            self.assertTrue(_code_formula_crop(page, equation, marker, path))
+            image = pymupdf.Pixmap(str(path))
+            self.assertGreater(image.width, 200)
+            self.assertGreater(image.height, 55)
         pdf.close()
 
     def test_unrecognized_formula_gets_image_without_changing_successful_math(self) -> None:
@@ -85,6 +102,32 @@ class FormulaEnhancerTests(unittest.TestCase):
                      r"电流表测电流，$\frac{U}{I}$ 表示电阻。")
         self.assertEqual(_normalize_repeated_resistance_fraction(candidate).count(r"\frac{U}{I}"), 2)
         self.assertEqual(_normalize_repeated_resistance_fraction(r"$\frac{U}{r}$"), r"$\frac{U}{r}$")
+
+    def test_late_prose_moves_between_formulae_without_reordering_math(self) -> None:
+        def item(index: int, label: str, top: float, value: str) -> dict:
+            return {"self_ref": f"#/texts/{index}", "label": label, "text": value,
+                    "prov": [{"page_no": 5, "bbox": {"t": top, "coord_origin": "BOTTOMLEFT"}}]}
+
+        data = {"texts": [item(0, "formula", 443, "equation 3"),
+                          item(1, "formula", 372, "equation 4"),
+                          item(2, "formula", 187, "equation 7"),
+                          item(3, "formula", 123, "equation 8"),
+                          item(4, "text", 408, "联立②③式得"),
+                          item(5, "text", 148, "联立相关各式得")],
+                "body": {"children": [{"$ref": f"#/texts/{index}"} for index in (0, 1, 2, 3, 4, 5)]}}
+        self.assertEqual(_repair_direct_text_order(data), [4, 5])
+        self.assertEqual([x["$ref"] for x in data["body"]["children"]],
+                         ["#/texts/0", "#/texts/4", "#/texts/1", "#/texts/2", "#/texts/5", "#/texts/3"])
+
+    def test_plain_paragraphs_without_equation_anchors_keep_their_order(self) -> None:
+        data = {"texts": [
+            {"label": "text", "text": str(i),
+             "prov": [{"page_no": 1, "bbox": {"t": top, "coord_origin": "BOTTOMLEFT"}}]}
+            for i, top in enumerate((300, 350, 325))],
+            "body": {"children": [{"$ref": f"#/texts/{i}"} for i in range(3)]}}
+        self.assertEqual(_repair_direct_text_order(data), [])
+        self.assertEqual([child["$ref"] for child in data["body"]["children"]],
+                         ["#/texts/0", "#/texts/1", "#/texts/2"])
 
     def test_inline_review_is_limited_to_corrupted_math_prose(self) -> None:
         self.assertTrue(_needs_inline_line_review({"label": "text", "text": "电压U ___ 电阻U/I ___ 的结果是否正确？", "prov": [{}]}))

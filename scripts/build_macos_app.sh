@@ -26,6 +26,7 @@ pyinstaller \
   --collect-data docx \
   --add-data "frontend/dist:frontend/dist" \
   --add-data "backend/app/formula_vl_worker.py:backend/app" \
+  --add-data "backend/app/formula_code_worker.py:backend/app" \
   --add-data "backend/app/formula_md_worker.py:backend/app" \
   desktop_app.py
 

@@ -79,6 +79,29 @@ def _formula_region_rects(page: pymupdf.Page, rect: pymupdf.Rect) -> tuple[pymup
     return visual, visual
 
 
+def _code_formula_crop(page: pymupdf.Page, equation: pymupdf.Rect,
+                       source_box: pymupdf.Rect, path: Path) -> bool:
+    """Make a 120 DPI, vertically padded formula-only crop for CodeFormulaV2."""
+    search = pymupdf.Rect(equation.x0, source_box.y0 - 12,
+                          equation.x1, source_box.y1 + 12) & page.rect
+    if search.width < 10 or search.height < 10:
+        return False
+    scale = 2
+    pixels = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), clip=search,
+                             colorspace=pymupdf.csGRAY, alpha=False)
+    ink_columns = [x for x in range(pixels.width)
+                   if sum(pixels.samples[y * pixels.stride + x] < 180
+                          for y in range(pixels.height)) >= 2]
+    if not ink_columns:
+        return False
+    left = max(search.x0, search.x0 + min(ink_columns) / scale - 1)
+    right = min(search.x1, max(search.x0 + max(ink_columns) / scale + 8, left + 135))
+    crop = pymupdf.Rect(left, search.y0, right, search.y1)
+    page.get_pixmap(matrix=pymupdf.Matrix(120 / 72, 120 / 72),
+                    clip=crop, alpha=False).save(str(path))
+    return True
+
+
 def _crop_regions(pdf_path: Path, items: list[dict], output_dir: Path, max_pages: int | None) -> list[dict]:
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest: list[dict] = []
@@ -102,6 +125,7 @@ def _crop_regions(pdf_path: Path, items: list[dict], output_dir: Path, max_pages
                 return pymupdf.Rect(box["l"], top, box["r"], bottom)
 
             rect = item_rect(item)
+            source_rect = rect
             crop_name = f"page-{page_number:02d}-text-{index:04d}.png"
             option = re.match(r"^\s*([A-F])[.．、]", item.get("orig", "") or item.get("text", ""))
             if option and len(item.get("text", "")) <= 35:
@@ -137,6 +161,10 @@ def _crop_regions(pdf_path: Path, items: list[dict], output_dir: Path, max_pages
                 page.get_pixmap(matrix=pymupdf.Matrix(4, 4), clip=fallback_rect,
                                 alpha=False).save(str(fallback_path))
                 entry["fallback_crop"] = str(fallback_path)
+                if not item.get("text", "").strip():
+                    code_path = output_dir / crop_name.replace(".png", "-code.png")
+                    if _code_formula_crop(page, rect, source_rect, code_path):
+                        entry["code_crop"] = str(code_path)
             manifest.append(entry)
     return manifest
 
@@ -468,7 +496,9 @@ def _apply_option_row(data: dict, row: dict, parsed: dict[str, str]) -> bool:
     return True
 
 
-def _read_paddle_output(process: subprocess.Popen, log: Callable[[str], None]) -> int:
+def _read_paddle_output(process: subprocess.Popen, log: Callable[[str], None],
+                        timeout_seconds: float | None = None,
+                        model_name: str = "PaddleOCR-VL") -> int:
     assert process.stdout is not None
     lines: Queue[str | None] = Queue()
 
@@ -481,10 +511,11 @@ def _read_paddle_output(process: subprocess.Popen, log: Callable[[str], None]) -
 
     Thread(target=read_lines, daemon=True).start()
     started = time.monotonic()
+    timeout_seconds = timeout_seconds if timeout_seconds is not None else PADDLE_TIMEOUT_SECONDS
     current_region = "模型加载中"
     while True:
         elapsed = time.monotonic() - started
-        if elapsed >= PADDLE_TIMEOUT_SECONDS:
+        if elapsed >= timeout_seconds:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
@@ -497,11 +528,11 @@ def _read_paddle_output(process: subprocess.Popen, log: Callable[[str], None]) -
                 except ProcessLookupError:
                     pass
                 process.wait()
-            raise RuntimeError("PaddleOCR-VL 超过 45 分钟仍未完成；已停止复核，原始 OCR 文件保留。")
+            raise RuntimeError(f"{model_name} 超过 {int(timeout_seconds // 60)} 分钟仍未完成；已停止复核，原始 OCR 文件保留。")
         try:
-            line = lines.get(timeout=min(30, PADDLE_TIMEOUT_SECONDS - elapsed))
+            line = lines.get(timeout=min(30, timeout_seconds - elapsed))
         except Empty:
-            log(f"PaddleOCR-VL 仍在运行：{current_region}，已耗时 {int(time.monotonic() - started)} 秒")
+            log(f"{model_name} 仍在运行：{current_region}，已耗时 {int(time.monotonic() - started)} 秒")
             continue
         if line is None:
             return process.wait()
@@ -509,6 +540,48 @@ def _read_paddle_output(process: subprocess.Popen, log: Callable[[str], None]) -
             current_region = line.removeprefix("REGION_START").strip()
         if line.startswith(("MODEL_LOADING", "MODEL_READY", "REGION_START", "REGION ", "ERROR ")):
             log(line)
+
+
+def _retry_code_formula(manifest: list[dict], results: dict[str, str], items: list[dict],
+                        log: Callable[[str], None]) -> dict[str, str]:
+    unresolved = []
+    for entry in manifest:
+        index = entry.get("index")
+        if not isinstance(index, int) or not entry.get("code_crop"):
+            continue
+        item = items[index]
+        if item.get("label") != "formula" or item.get("text", "").strip():
+            continue
+        candidate = _clean_candidate(results.get(str(index), ""), item)
+        if not _accept_candidate("", candidate, "formula")[0]:
+            unresolved.append(entry)
+    if not unresolved or not DOCLING_PYTHON.is_file():
+        return {}
+    log(f"CodeFormulaV2 单独复核未识别公式：{len(unresolved)} 处")
+    with tempfile.TemporaryDirectory(prefix="formula-code-") as tmp:
+        manifest_path = Path(tmp) / "manifest.json"
+        result_path = Path(tmp) / "results.json"
+        manifest_path.write_text(json.dumps(unresolved, ensure_ascii=False), encoding="utf-8")
+        env = os.environ.copy()
+        env["HF_HUB_OFFLINE"] = "1"
+        env["PYTHONUNBUFFERED"] = "1"
+        command = [str(DOCLING_PYTHON), str(Path(__file__).with_name("formula_code_worker.py")),
+                   str(manifest_path), str(result_path)]
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, env=env, bufsize=1, start_new_session=True)
+        register_process(process)
+        try:
+            return_code = _read_paddle_output(process, log, timeout_seconds=min(900, 180 + 120 * len(unresolved)),
+                                              model_name="CodeFormulaV2")
+        except RuntimeError as exc:
+            log(str(exc))
+            return {}
+        finally:
+            unregister_process(process)
+        if return_code or not result_path.is_file():
+            log("CodeFormulaV2 单独复核失败；继续保留公式原图")
+            return {}
+        return json.loads(result_path.read_text(encoding="utf-8"))
 
 
 def _ordered_blank_formulas(data: dict) -> list[int]:
@@ -530,6 +603,72 @@ def _ordered_blank_formulas(data: dict) -> list[int]:
 
     visit(data["body"].get("children", []))
     return ordered
+
+
+def _root_position(data: dict, ref: str) -> tuple[int, float] | None:
+    parts = ref.strip("#/").split("/")
+    if len(parts) != 2 or not parts[1].isdigit():
+        return None
+    kind, index = parts[0], int(parts[1])
+    if kind == "groups":
+        positions = [_root_position(data, child.get("$ref", ""))
+                     for child in data["groups"][index].get("children", [])]
+        positions = [position for position in positions if position is not None]
+        return min(positions) if positions else None
+    item = data.get(kind, [])[index]
+    if not item.get("prov"):
+        return None
+    provenance = item["prov"][0]
+    bbox = provenance.get("bbox", {})
+    if "t" not in bbox:
+        return None
+    top = -bbox["t"] if bbox.get("coord_origin") == "BOTTOMLEFT" else bbox["t"]
+    return provenance["page_no"], top
+
+
+def _repair_direct_text_order(data: dict) -> list[int]:
+    """Insert late OCR prose back between the formulas indicated by its PDF Y coordinate."""
+    children = data["body"].get("children", [])
+    moved: list[int] = []
+
+    def formula_position(child: dict) -> tuple[int, float] | None:
+        ref = child.get("$ref", "")
+        if not ref.startswith("#/texts/"):
+            return None
+        index = int(ref.rsplit("/", 1)[1])
+        if data["texts"][index].get("label") != "formula":
+            return None
+        return _root_position(data, ref)
+
+    text_refs = [child["$ref"] for child in children if child.get("$ref", "").startswith("#/texts/")]
+    for ref in text_refs:
+        index = int(ref.rsplit("/", 1)[1])
+        if data["texts"][index].get("label") != "text":
+            continue
+        current = next(position for position, child in enumerate(children) if child.get("$ref") == ref)
+        source_position = _root_position(data, ref)
+        if source_position is None:
+            continue
+        page, y = source_position
+        # Only move prose that Docling placed after *both* neighbouring equations.
+        # This avoids changing normal paragraph order on multi-column pages.
+        above = [position for position, child in enumerate(children[:current])
+                 if (anchor := formula_position(child)) is not None
+                 and anchor[0] == page and anchor[1] < y - 10]
+        below = [position for position, child in enumerate(children[:current])
+                 if (anchor := formula_position(child)) is not None
+                 and anchor[0] == page and anchor[1] > y + 10]
+        if not above or not below or max(above) >= min(below):
+            continue
+        target = next((position for position, child in enumerate(children[:current])
+                       if not child.get("$ref", "").startswith("#/pictures/")
+                       and (other := _root_position(data, child.get("$ref", ""))) is not None
+                       and other[0] == page and other[1] > y + 10), None)
+        if target is not None:
+            child = children.pop(current)
+            children.insert(target, child)
+            moved.append(index)
+    return moved
 
 
 def _insert_visual_formula_fallbacks(md_path: Path, data: dict, fallback_paths: dict[int, str]) -> int:
@@ -572,6 +711,7 @@ def enhance_formula_regions(
     md_path = dataset_dir / f"{output_name}.md"
     data = json.loads(json_path.read_text(encoding="utf-8"))
     items = data["texts"]
+    reordered = _repair_direct_text_order(data)
     crops_dir = dataset_dir / "formula_regions"
     manifest = _crop_regions(pdf_path, items, crops_dir, max_pages)
     manifest.extend(_inline_line_regions(pdf_path, items, crops_dir, max_pages))
@@ -579,7 +719,21 @@ def enhance_formula_regions(
     log(f"待复核区域：{len(manifest)} 处；裁图保存在 formula_regions/")
     report_path = dataset_dir / f"{output_name}_公式复核.json"
     if not manifest:
-        report_path.write_text(json.dumps({"regions": []}, ensure_ascii=False, indent=2), encoding="utf-8")
+        report_path.write_text(json.dumps({"regions": [], "accepted": 0,
+                                           "reading_order_repaired": reordered},
+                                          ensure_ascii=False, indent=2), encoding="utf-8")
+        if reordered:
+            shutil.copy2(json_path, dataset_dir / f"{output_name}_原始OCR.json")
+            shutil.copy2(md_path, dataset_dir / f"{output_name}_原始OCR.md")
+            json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            export = subprocess.run(
+                [str(DOCLING_PYTHON), str(Path(__file__).with_name("formula_md_worker.py")),
+                 str(json_path), str(md_path)], capture_output=True, text=True, timeout=120)
+            if export.returncode:
+                shutil.copy2(dataset_dir / f"{output_name}_原始OCR.json", json_path)
+                shutil.copy2(dataset_dir / f"{output_name}_原始OCR.md", md_path)
+                raise RuntimeError(f"正文顺序重建失败：{export.stderr.strip()}")
+            log(f"已按原 PDF 坐标修复 {len(reordered)} 处正文顺序")
         return report_path
 
     with tempfile.TemporaryDirectory(prefix="formula-vl-") as tmp:
@@ -601,6 +755,8 @@ def enhance_formula_regions(
         if return_code != 0 or not result_path.is_file():
             raise RuntimeError("PaddleOCR-VL 公式复核失败；原 OCR 文件未被修改")
         results = json.loads(result_path.read_text(encoding="utf-8"))
+
+    code_results = _retry_code_formula(manifest, results, items, log)
 
     report: list[dict] = []
     accepted = 0
@@ -625,6 +781,13 @@ def enhance_formula_regions(
         raw = results.get(str(index), "")
         candidate = _clean_candidate(raw, item)
         use, reason = _accept_candidate(original, candidate, item.get("label", ""))
+        if not use and item.get("label") == "formula" and str(index) in code_results:
+            code_candidate = _clean_candidate(code_results[str(index)], item)
+            code_use, code_reason = _accept_candidate(original, code_candidate, "formula")
+            if code_use:
+                candidate, use, reason = code_candidate, True, "CodeFormulaV2 单条公式复核采用；仍建议对照裁图检查"
+            else:
+                reason = f"PaddleOCR-VL 与 CodeFormulaV2 未可靠识别；{code_reason}"
         if use:
             item["text"] = candidate
             accepted += 1
@@ -655,12 +818,15 @@ def enhance_formula_regions(
                        "crops": [str(Path(entry["crop"]).relative_to(dataset_dir)) for entry in entries],
                        "original": original, "candidate": candidate, "accepted": use,
                        "reason": reason})
-    report_path.write_text(json.dumps({"regions": report, "accepted": accepted}, ensure_ascii=False, indent=2), encoding="utf-8")
+    report_path.write_text(json.dumps({"regions": report, "accepted": accepted,
+                                       "reading_order_repaired": reordered}, ensure_ascii=False, indent=2), encoding="utf-8")
     log(f"自动采用 {accepted}/{len(report)} 处；逐项记录：{report_path.name}")
-    if accepted or fallback_paths:
+    if reordered:
+        log(f"已按原 PDF 坐标修复 {len(reordered)} 处正文顺序")
+    if accepted or fallback_paths or reordered:
         shutil.copy2(json_path, dataset_dir / f"{output_name}_原始OCR.json")
         shutil.copy2(md_path, dataset_dir / f"{output_name}_原始OCR.md")
-        if accepted:
+        if accepted or reordered:
             json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             export = subprocess.run(
                 [str(DOCLING_PYTHON), str(Path(__file__).with_name("formula_md_worker.py")), str(json_path), str(md_path)],

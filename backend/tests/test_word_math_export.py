@@ -18,13 +18,15 @@ class WordMathExportTests(unittest.TestCase):
             output = root / "sample.docx"
             markdown.write_text(
                 "电阻 $\\frac{U}{I}$。\n\n$$\nW=mgR\n$$\n\n"
-                "$$\nmgh+mgR=\\frac{1}{2}mv_0^2\n$$\n", encoding="utf-8",
+                "$$\nmgh+mgR=\\frac{1}{2}mv_0^2\n$$\n\n"
+                "$$\nv_{0}=\\frac{3}{2}\\sqrt{2gR}\n$$\n", encoding="utf-8",
             )
             export_editable_docx(markdown, output)
             with ZipFile(output) as archive:
                 document = archive.read("word/document.xml").decode("utf-8")
-        self.assertGreaterEqual(document.count("<m:oMath>"), 3)
+        self.assertGreaterEqual(document.count("<m:oMath>"), 4)
         self.assertNotIn("\\frac", document)
+        self.assertNotIn("\\sqrt", document)
         self.assertNotIn("W=mgR", document)
 
 
